@@ -21,11 +21,6 @@ EMOTION_LABELS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surpri
 
 
 def _rebuild_emotion_model():
-    """
-    Rebuilds the exact EmotionRecognitionCNN architecture from scratch.
-    Used as a fallback when the saved model config is incompatible with the
-    current TensorFlow version (e.g. 'batch_shape' keyword removed in TF 2.16+).
-    """
     model = Sequential(name="EmotionRecognitionCNN")
 
     # Block 1
@@ -76,154 +71,139 @@ def _rebuild_emotion_model():
     return model
 
 
-def load_emotion_model(model_path="saved_models/emotion_model.keras"):
+def load_emotion_model(model_path="saved_models/emotion_model.tflite"):
     """
-    Loads the trained emotion recognition model with a two-stage fallback:
-      1. Try standard load_model() — works when TF version matches save version.
-      2. If config deserialization fails (e.g. 'batch_shape' error on newer TF),
-         rebuild the architecture and load weights only from the .h5 file.
+    Loads emotion model. Prefers TFLite format (ultra-fast, ~10MB RAM usage on cloud),
+    with fallback to Keras/H5 models if TFLite is unavailable.
     """
-    # Resolve keras path and h5 fallback path
     base_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else "saved_models"
-    keras_path = os.path.join(base_dir, "emotion_model.keras") if not model_path.endswith(".keras") else model_path
+    tflite_path = os.path.join(base_dir, "emotion_model.tflite")
+    keras_path = os.path.join(base_dir, "emotion_model.keras")
     h5_path = os.path.join(base_dir, "emotion_model.h5")
 
-    # Determine which file actually exists
-    if not os.path.exists(keras_path) and not os.path.exists(h5_path):
-        raise FileNotFoundError(
-            f"No model file found at '{keras_path}' or '{h5_path}'. Run train.py first!")
+    # 1. Prefer TFLite (Ultra-fast, lowest memory usage for cloud containers)
+    if os.path.exists(tflite_path):
+        try:
+            interpreter = tf.lite.Interpreter(model_path=tflite_path)
+            interpreter.allocate_tensors()
+            print(f"[SUCCESS] TFLite model loaded into memory: {tflite_path}")
+            return interpreter
+        except Exception as e:
+            print(f"[WARNING] TFLite load failed: {e}")
 
-    # ── Stage 1: Try direct load ─────────────────────────────────────────────
+    # 2. Try direct Keras / H5 load
     for path in [keras_path, h5_path]:
         if os.path.exists(path):
             try:
                 model = load_model(path)
-                print(f"[SUCCESS] Model loaded directly from: {path}")
+                print(f"[SUCCESS] Keras Model loaded from: {path}")
                 return model
             except Exception as e:
                 print(f"[WARNING] Direct load failed for '{path}': {e}")
-                print("[INFO] Falling back to architecture-rebuild + weights-only load...")
                 break
 
-    # ── Stage 2: Rebuild architecture, load weights from .h5 ────────────────
-    # .h5 stores weights separately from config so it bypasses the batch_shape issue
+    # 3. Fallback to architecture rebuild + weights load
     weights_path = h5_path if os.path.exists(h5_path) else keras_path
-    try:
-        model = _rebuild_emotion_model()
-        model.load_weights(weights_path)
-        print(f"[SUCCESS] Model rebuilt and weights loaded from: {weights_path}")
-        return model
-    except Exception as e2:
-        raise RuntimeError(
-            f"[ERROR] Both load strategies failed. Last error: {e2}\n"
-            "Please retrain the model with the current TensorFlow version."
-        ) from e2
+    if os.path.exists(weights_path):
+        try:
+            model = _rebuild_emotion_model()
+            model.load_weights(weights_path)
+            print(f"[SUCCESS] Model rebuilt & weights loaded from: {weights_path}")
+            return model
+        except Exception as e2:
+            raise RuntimeError(f"[ERROR] All model load strategies failed: {e2}") from e2
+
+    raise FileNotFoundError("No model file (.tflite, .h5, or .keras) found in saved_models/")
+
+
+def run_model_inference(model_or_interpreter, input_tensor):
+    """Executes model inference on both TFLite Interpreter and Keras Model objects."""
+    if isinstance(model_or_interpreter, tf.lite.Interpreter):
+        inp_details = model_or_interpreter.get_input_details()
+        out_details = model_or_interpreter.get_output_details()
+        model_or_interpreter.set_tensor(inp_details[0]['index'], input_tensor.astype(np.float32))
+        model_or_interpreter.invoke()
+        return model_or_interpreter.get_tensor(out_details[0]['index'])[0]
+    else:
+        return model_or_interpreter.predict(input_tensor, verbose=0)[0]
+
 
 def extract_facial_dynamics(face_roi):
-    """
-    Computes dynamic facial structural feature signatures:
-    - Lower face variance & open mouth ratio (Happy vs Surprise vs Neutral)
-    - Eyebrow / eye contrast (Angry vs Fear vs Sad)
-    - High-frequency edge density
-    """
+    """Computes dynamic facial structural feature signatures."""
     if len(face_roi.shape) == 3:
         gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
     else:
         gray = face_roi
-        
+
     h, w = gray.shape
     if h < 10 or w < 10:
         return np.ones(7) / 7.0
-        
-    # Split facial regions: upper (eyes/brows), lower (mouth/chin)
-    upper_face = gray[0:int(h*0.55), :]
-    lower_face = gray[int(h*0.55):h, :]
-    
-    # Edge density
+
+    upper_face = gray[0:int(h * 0.55), :]
+    lower_face = gray[int(h * 0.55):h, :]
+
     edges_lower = cv2.Canny(lower_face, 50, 150)
     edge_density_lower = np.mean(edges_lower) / 255.0
-    
-    # Intensity variance in lower face (smile/open mouth creates variance)
+
     lower_var = np.std(lower_face)
     upper_var = np.std(upper_face)
-    
-    # Calculate relative facial feature scores
+
     scores = np.zeros(7)
-    
-    # Happy: Open smile / raised cheeks -> high lower face edge density & variance
     scores[3] = (edge_density_lower * 1.8) + (lower_var / 80.0)
-    
-    # Neutral: Smooth lower face, balanced upper/lower variance
     scores[4] = 1.0 / (1.0 + abs(lower_var - upper_var) / 20.0 + edge_density_lower * 2.0)
-    
-    # Surprise: High vertical height, open dark mouth cavity
     scores[6] = (lower_var / 60.0) * 1.5 if (lower_face.mean() < gray.mean() * 0.9) else 0.2
-    
-    # Angry: High upper eyebrow edge density & low mouth variance
+
     edges_upper = cv2.Canny(upper_face, 60, 160)
     scores[0] = (np.mean(edges_upper) / 255.0) * 1.4
-    
-    # Sad: Low brightness in lower face & drooping brows
     scores[5] = (upper_var / 70.0) * 1.1
-    
-    # Fear & Disgust
     scores[2] = (edge_density_lower * 0.8) + (upper_var / 90.0)
     scores[1] = (lower_var / 100.0)
-    
-    # Softmax normalization
+
     exp_scores = np.exp(scores - np.max(scores))
-    dynamic_probs = exp_scores / np.sum(exp_scores)
-    return dynamic_probs
+    return exp_scores / np.sum(exp_scores)
+
 
 def predict_single_image(image_path, model=None):
-    """
-    Predicts facial emotion from an input image path with dynamic facial feature fusion:
-    1. Reads image file
-    2. Detects face ROI using Haar Cascade (with fallback)
-    3. Preprocesses face region
-    4. Predicts emotion class & confidence percentage
-    """
+    """Predicts facial emotion from an input image path with facial dynamics fusion."""
     if model is None:
         model = load_emotion_model()
-        
+
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image not found at path: {image_path}")
-        
+
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Could not decode image file at: {image_path}")
-        
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
+
     faces = []
     try:
-        if hasattr(cv2, 'CascadeClassifier'):
-            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            if os.path.exists(cascade_path):
-                face_cascade = cv2.CascadeClassifier(cascade_path)
-                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-    except Exception as e:
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        if os.path.exists(cascade_path):
+            face_cascade = cv2.CascadeClassifier(cascade_path)
+            detected = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+            if len(detected) > 0:
+                faces = detected
+    except Exception:
         faces = []
-        
+
     results = []
-    
+
     if len(faces) == 0:
-        # Full frame fallback
         processed = preprocess_frame(img)
-        cnn_preds = model.predict(processed, verbose=0)[0]
+        cnn_preds = run_model_inference(model, processed)
         dyn_preds = extract_facial_dynamics(gray)
-        
-        # Fuse CNN predictions with image-specific facial structural dynamics
+
         fused_preds = (cnn_preds * 0.65) + (dyn_preds * 0.35)
         fused_preds = fused_preds / np.sum(fused_preds)
-        
-        class_idx = np.argmax(fused_preds)
+
+        class_idx = int(np.argmax(fused_preds))
         confidence = float(fused_preds[class_idx]) * 100.0
-        emotion_label = EMOTION_LABELS[class_idx]
-        
+
         results.append({
             "box": (0, 0, img.shape[1], img.shape[0]),
-            "emotion": emotion_label,
+            "emotion": EMOTION_LABELS[class_idx],
             "confidence": confidence,
             "probabilities": {EMOTION_LABELS[i]: float(fused_preds[i]) * 100.0 for i in range(len(EMOTION_LABELS))}
         })
@@ -231,31 +211,30 @@ def predict_single_image(image_path, model=None):
         for (x, y, w, h) in faces:
             face_roi = img[y:y+h, x:x+w]
             processed = preprocess_frame(face_roi)
-            cnn_preds = model.predict(processed, verbose=0)[0]
+            cnn_preds = run_model_inference(model, processed)
             dyn_preds = extract_facial_dynamics(face_roi)
-            
-            # Fuse CNN predictions with face ROI structural dynamics
+
             fused_preds = (cnn_preds * 0.65) + (dyn_preds * 0.35)
             fused_preds = fused_preds / np.sum(fused_preds)
-            
-            class_idx = np.argmax(fused_preds)
+
+            class_idx = int(np.argmax(fused_preds))
             confidence = float(fused_preds[class_idx]) * 100.0
-            emotion_label = EMOTION_LABELS[class_idx]
-            
+
             results.append({
-                "box": (x, y, w, h),
-                "emotion": emotion_label,
+                "box": (int(x), int(y), int(w), int(h)),
+                "emotion": EMOTION_LABELS[class_idx],
                 "confidence": confidence,
                 "probabilities": {EMOTION_LABELS[i]: float(fused_preds[i]) * 100.0 for i in range(len(EMOTION_LABELS))}
             })
-            
+
     return results, img
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Predict Facial Emotion from an Image")
     parser.add_argument("--image", type=str, default=None, help="Path to input face image")
     args = parser.parse_args()
-    
+
     image_path = args.image
     if image_path is None:
         sample_path = "dataset/test/happy/happy_syn_0.png"
@@ -264,11 +243,11 @@ if __name__ == "__main__":
         else:
             print("[INFO] No input image provided.")
             sys.exit(0)
-            
+
     print(f"\n[INFO] Running emotion prediction on: {image_path}")
     model = load_emotion_model()
     results, original_img = predict_single_image(image_path, model=model)
-    
+
     for idx, res in enumerate(results):
         print(f"\n--- Detection #{idx+1} ---")
         print(f"Predicted Emotion : {res['emotion']}")
