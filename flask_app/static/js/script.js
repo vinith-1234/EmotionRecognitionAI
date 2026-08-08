@@ -104,7 +104,6 @@ document.addEventListener('DOMContentLoaded', () => {
         selectedFile = file;
         btnPredict.disabled = false;
 
-        // Show image preview locally immediately
         const reader = new FileReader();
         reader.onload = (e) => {
             currentPreviewDataUrl = e.target.result;
@@ -158,10 +157,20 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: formData
             });
 
-            const data = await response.json();
+            let data;
+            const textResponse = await response.text();
+
+            try {
+                data = JSON.parse(textResponse);
+            } catch (pErr) {
+                console.error("Non-JSON Server Response:", textResponse);
+                alert(`Server Response Error (${response.status}): The server took too long or crashed. Please retry.`);
+                hideLoadingState();
+                return;
+            }
 
             if (!response.ok || data.error) {
-                alert(`Prediction Error: ${data.error || 'Server error'}`);
+                alert(`Prediction Error: ${data.error || 'Server processing error'}`);
                 hideLoadingState();
                 return;
             }
@@ -171,7 +180,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         } catch (err) {
             console.error(err);
-            alert('Failed to connect to emotion prediction server.');
+            alert('Failed to connect to emotion prediction server. Please try again.');
             hideLoadingState();
         }
     });
@@ -188,7 +197,7 @@ document.addEventListener('DOMContentLoaded', () => {
             btnStartCam.disabled = true;
         } catch (err) {
             console.error(err);
-            alert('Could not access camera. Please grant browser camera permissions.');
+            alert('Could not access camera. Please grant camera permissions in your browser.');
         }
     });
 
@@ -208,13 +217,12 @@ document.addEventListener('DOMContentLoaded', () => {
     btnCaptureCam.addEventListener('click', async () => {
         if (!cameraStream) return;
 
-        // Capture frame onto canvas
         const ctx = webcamCanvas.getContext('2d');
         webcamCanvas.width = webcamVideo.videoWidth || 640;
         webcamCanvas.height = webcamVideo.videoHeight || 480;
         ctx.drawImage(webcamVideo, 0, 0, webcamCanvas.width, webcamCanvas.height);
 
-        const frameBase64 = webcamCanvas.toDataURL('image/jpeg', 0.9);
+        const frameBase64 = webcamCanvas.toDataURL('image/jpeg', 0.85);
         showLoadingState(frameBase64);
 
         try {
@@ -224,7 +232,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify({ image_data: frameBase64 })
             });
 
-            const data = await response.json();
+            let data;
+            const textResponse = await response.text();
+
+            try {
+                data = JSON.parse(textResponse);
+            } catch (pErr) {
+                console.error("Non-JSON Server Response:", textResponse);
+                alert(`Camera Server Error (${response.status}): Server took too long or crashed. Please retry.`);
+                hideLoadingState();
+                return;
+            }
 
             if (!response.ok || data.error) {
                 alert(`Camera Prediction Error: ${data.error || 'Server error'}`);
@@ -236,7 +254,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         } catch (err) {
             console.error(err);
-            alert('Failed to process live camera frame.');
+            alert('Failed to process live camera frame. Please try again.');
             hideLoadingState();
         }
     });
@@ -270,7 +288,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
         barsList.innerHTML = '';
 
-        // Sort probabilities descending
         const entries = Object.entries(probabilities).sort((a, b) => b[1] - a[1]);
 
         entries.forEach(([em, val]) => {

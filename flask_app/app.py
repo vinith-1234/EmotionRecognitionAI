@@ -1,4 +1,11 @@
 import os
+
+# ── Limit TensorFlow Memory and CPU Thread Overhead for Free Cloud Tier (512MB RAM)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
+os.environ['TF_NUM_INTEROP_THREADS'] = '1'
+
 import sys
 import base64
 import cv2
@@ -31,7 +38,7 @@ try:
     MODEL = load_emotion_model(MODEL_PATH)
     print("[SUCCESS] Deep Learning Model loaded into Flask application context.")
 except Exception as e:
-    print(f"[ERROR] Model load failed: {e}")
+    print(f"[ERROR] Startup Model load failed: {e}")
     MODEL = None
 
 
@@ -41,7 +48,7 @@ def get_model():
         try:
             MODEL = load_emotion_model(MODEL_PATH)
         except Exception as e:
-            raise RuntimeError(f"Model not available: {e}")
+            raise RuntimeError(f"Model initialization failed: {e}")
     return MODEL
 
 
@@ -83,7 +90,7 @@ def predict_emotion_route():
             emotion  = res['emotion']
             conf     = res['confidence']
             cv2.rectangle(annotated_img, (x, y), (x + w, y + h), (99, 102, 241), 3)
-            label = f"{emotion}  {conf:.1f}%"
+            label = f"{emotion} {conf:.1f}%"
             cv2.putText(annotated_img, label, (x, max(y - 12, 20)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (99, 102, 241), 2)
 
@@ -91,7 +98,7 @@ def predict_emotion_route():
         annotated_filepath = os.path.join(app.config['UPLOAD_FOLDER'], annotated_filename)
         cv2.imwrite(annotated_filepath, annotated_img)
 
-        # Also return the original image as base64 for immediate preview
+        # Return Base64 encoded outputs
         _, orig_buf = cv2.imencode('.jpg', original_img)
         orig_b64 = "data:image/jpeg;base64," + base64.b64encode(orig_buf).decode('utf-8')
 
@@ -105,23 +112,24 @@ def predict_emotion_route():
             'original_b64':  orig_b64,
             'annotated_b64': ann_b64,
             'annotated_image_url': f'/uploads/{annotated_filename}',
-            'top_emotion':  primary['emotion']     if primary else 'Unknown',
+            'top_emotion':  primary['emotion']     if primary else 'Neutral',
             'confidence':   round(primary['confidence'], 2) if primary else 0.0,
             'probabilities': primary['probabilities'] if primary else {},
             'num_faces':    len(results)
         })
 
     except Exception as e:
-        return jsonify({'error': f'Prediction failed: {str(e)}'}), 500
+        print(f"[ERROR] /predict endpoint error: {e}")
+        return jsonify({'error': f'Prediction execution failed: {str(e)}'}), 500
 
 
 @app.route('/predict_frame', methods=['POST'])
 def predict_frame_route():
     """Receives base64 webcam frame and returns emotion prediction."""
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
         if not data or 'image_data' not in data:
-            return jsonify({'error': 'No frame data provided'}), 400
+            return jsonify({'error': 'No camera frame data provided'}), 400
 
         image_data = data['image_data']
         if ',' in image_data:
@@ -134,21 +142,19 @@ def predict_frame_route():
         if img is None:
             return jsonify({'error': 'Could not decode camera frame'}), 400
 
-        # Save temp file for processing
         temp_path = os.path.join(app.config['UPLOAD_FOLDER'], 'webcam_temp.jpg')
         cv2.imwrite(temp_path, img)
 
         model = get_model()
         results, original_img = predict_single_image(temp_path, model=model)
 
-        # Draw on annotated copy
         annotated = original_img.copy()
         for res in results:
             x, y, w, h = res['box']
             emotion  = res['emotion']
             conf     = res['confidence']
             cv2.rectangle(annotated, (x, y), (x + w, y + h), (99, 102, 241), 3)
-            label = f"{emotion}  {conf:.1f}%"
+            label = f"{emotion} {conf:.1f}%"
             cv2.putText(annotated, label, (x, max(y - 12, 20)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (99, 102, 241), 2)
 
@@ -160,14 +166,15 @@ def predict_frame_route():
         return jsonify({
             'success': True,
             'annotated_b64': ann_b64,
-            'top_emotion':   primary['emotion']       if primary else 'Unknown',
+            'top_emotion':   primary['emotion']       if primary else 'Neutral',
             'confidence':    round(primary['confidence'], 2) if primary else 0.0,
             'probabilities': primary['probabilities'] if primary else {},
             'num_faces':     len(results)
         })
 
     except Exception as e:
-        return jsonify({'error': f'Camera prediction failed: {str(e)}'}), 500
+        print(f"[ERROR] /predict_frame endpoint error: {e}")
+        return jsonify({'error': f'Live camera processing failed: {str(e)}'}), 500
 
 
 @app.route('/uploads/<filename>')
