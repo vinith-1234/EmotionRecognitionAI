@@ -4,20 +4,114 @@ import argparse
 import cv2
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import load_model
+from tensorflow.keras.models import load_model, Sequential
+from tensorflow.keras.layers import (Conv2D, MaxPooling2D, Flatten, Dense,
+                                      Dropout, BatchNormalization, Activation)
+from tensorflow.keras.optimizers import Adam
 
 from preprocessing.preprocess import preprocess_frame
 
 EMOTION_LABELS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
 
+
+def _rebuild_emotion_model():
+    """
+    Rebuilds the exact EmotionRecognitionCNN architecture from scratch.
+    Used as a fallback when the saved model config is incompatible with the
+    current TensorFlow version (e.g. 'batch_shape' keyword removed in TF 2.16+).
+    """
+    model = Sequential(name="EmotionRecognitionCNN")
+
+    # Block 1
+    model.add(Conv2D(32, (3, 3), padding='same', input_shape=(48, 48, 1)))
+    model.add(BatchNormalization())
+    model.add(Activation('relu'))
+    model.add(Conv2D(64, (3, 3), padding='same'))
+    model.add(BatchNormalization())
+    model.add(Activation('relu'))
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Dropout(0.25))
+
+    # Block 2
+    model.add(Conv2D(128, (3, 3), padding='same'))
+    model.add(BatchNormalization())
+    model.add(Activation('relu'))
+    model.add(Conv2D(128, (3, 3), padding='same'))
+    model.add(BatchNormalization())
+    model.add(Activation('relu'))
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Dropout(0.25))
+
+    # Block 3
+    model.add(Conv2D(256, (3, 3), padding='same'))
+    model.add(BatchNormalization())
+    model.add(Activation('relu'))
+    model.add(Conv2D(256, (3, 3), padding='same'))
+    model.add(BatchNormalization())
+    model.add(Activation('relu'))
+    model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Dropout(0.25))
+
+    # Classifier Head
+    model.add(Flatten())
+    model.add(Dense(512))
+    model.add(BatchNormalization())
+    model.add(Activation('relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(256))
+    model.add(BatchNormalization())
+    model.add(Activation('relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(7, activation='softmax', name="emotion_output"))
+
+    model.compile(optimizer=Adam(learning_rate=0.0005),
+                  loss='categorical_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+
 def load_emotion_model(model_path="saved_models/emotion_model.keras"):
-    if not os.path.exists(model_path):
-        alt_path = "saved_models/emotion_model.h5"
-        if os.path.exists(alt_path):
-            model_path = alt_path
-        else:
-            raise FileNotFoundError(f"Model file not found at {model_path}. Run train.py first!")
-    return load_model(model_path)
+    """
+    Loads the trained emotion recognition model with a two-stage fallback:
+      1. Try standard load_model() — works when TF version matches save version.
+      2. If config deserialization fails (e.g. 'batch_shape' error on newer TF),
+         rebuild the architecture and load weights only from the .h5 file.
+    """
+    # Resolve keras path and h5 fallback path
+    base_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else "saved_models"
+    keras_path = os.path.join(base_dir, "emotion_model.keras") if not model_path.endswith(".keras") else model_path
+    h5_path = os.path.join(base_dir, "emotion_model.h5")
+
+    # Determine which file actually exists
+    if not os.path.exists(keras_path) and not os.path.exists(h5_path):
+        raise FileNotFoundError(
+            f"No model file found at '{keras_path}' or '{h5_path}'. Run train.py first!")
+
+    # ── Stage 1: Try direct load ─────────────────────────────────────────────
+    for path in [keras_path, h5_path]:
+        if os.path.exists(path):
+            try:
+                model = load_model(path)
+                print(f"[SUCCESS] Model loaded directly from: {path}")
+                return model
+            except Exception as e:
+                print(f"[WARNING] Direct load failed for '{path}': {e}")
+                print("[INFO] Falling back to architecture-rebuild + weights-only load...")
+                break
+
+    # ── Stage 2: Rebuild architecture, load weights from .h5 ────────────────
+    # .h5 stores weights separately from config so it bypasses the batch_shape issue
+    weights_path = h5_path if os.path.exists(h5_path) else keras_path
+    try:
+        model = _rebuild_emotion_model()
+        model.load_weights(weights_path)
+        print(f"[SUCCESS] Model rebuilt and weights loaded from: {weights_path}")
+        return model
+    except Exception as e2:
+        raise RuntimeError(
+            f"[ERROR] Both load strategies failed. Last error: {e2}\n"
+            "Please retrain the model with the current TensorFlow version."
+        ) from e2
 
 def extract_facial_dynamics(face_roi):
     """
