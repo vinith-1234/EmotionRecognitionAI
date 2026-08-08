@@ -1,19 +1,16 @@
 import os
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
-os.environ['TF_NUM_INTEROP_THREADS'] = '1'
-
 import sys
+import gc
 import argparse
 import cv2
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import load_model, Sequential
-from tensorflow.keras.layers import (Conv2D, MaxPooling2D, Flatten, Dense,
-                                      Dropout, BatchNormalization, Activation)
-from tensorflow.keras.optimizers import Adam
+
+# ── Limit TensorFlow CPU thread and memory overhead for cloud containers ─────
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
+os.environ['TF_NUM_INTEROP_THREADS'] = '1'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 from preprocessing.preprocess import preprocess_frame
 
@@ -21,6 +18,12 @@ EMOTION_LABELS = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surpri
 
 
 def _rebuild_emotion_model():
+    """Rebuilds EmotionRecognitionCNN architecture when fallback is needed."""
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import (Conv2D, MaxPooling2D, Flatten, Dense,
+                                          Dropout, BatchNormalization, Activation)
+    from tensorflow.keras.optimizers import Adam
+
     model = Sequential(name="EmotionRecognitionCNN")
 
     # Block 1
@@ -53,7 +56,7 @@ def _rebuild_emotion_model():
     model.add(MaxPooling2D(pool_size=(2, 2)))
     model.add(Dropout(0.25))
 
-    # Classifier Head
+    # Head
     model.add(Flatten())
     model.add(Dense(512))
     model.add(BatchNormalization())
@@ -73,29 +76,34 @@ def _rebuild_emotion_model():
 
 def load_emotion_model(model_path="saved_models/emotion_model.tflite"):
     """
-    Loads emotion model. Prefers TFLite format (ultra-fast, ~10MB RAM usage on cloud),
-    with fallback to Keras/H5 models if TFLite is unavailable.
+    Loads emotion model into memory. Prefers TFLite format (~5.7MB file, ~15MB RAM usage).
     """
     base_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else "saved_models"
     tflite_path = os.path.join(base_dir, "emotion_model.tflite")
     keras_path = os.path.join(base_dir, "emotion_model.keras")
     h5_path = os.path.join(base_dir, "emotion_model.h5")
 
-    # 1. Prefer TFLite (Ultra-fast, lowest memory usage for cloud containers)
+    # 1. Prefer TFLite (Ultra-fast & lightweight)
     if os.path.exists(tflite_path):
         try:
+            import tensorflow as tf
             interpreter = tf.lite.Interpreter(model_path=tflite_path)
             interpreter.allocate_tensors()
-            print(f"[SUCCESS] TFLite model loaded into memory: {tflite_path}")
+            gc.collect()
+            print(f"[SUCCESS] Ultra-fast TFLite model loaded into memory: {tflite_path}")
             return interpreter
         except Exception as e:
             print(f"[WARNING] TFLite load failed: {e}")
 
     # 2. Try direct Keras / H5 load
+    import tensorflow as tf
+    from tensorflow.keras.models import load_model
+
     for path in [keras_path, h5_path]:
         if os.path.exists(path):
             try:
                 model = load_model(path)
+                gc.collect()
                 print(f"[SUCCESS] Keras Model loaded from: {path}")
                 return model
             except Exception as e:
@@ -108,6 +116,7 @@ def load_emotion_model(model_path="saved_models/emotion_model.tflite"):
         try:
             model = _rebuild_emotion_model()
             model.load_weights(weights_path)
+            gc.collect()
             print(f"[SUCCESS] Model rebuilt & weights loaded from: {weights_path}")
             return model
         except Exception as e2:
@@ -118,6 +127,7 @@ def load_emotion_model(model_path="saved_models/emotion_model.tflite"):
 
 def run_model_inference(model_or_interpreter, input_tensor):
     """Executes model inference on both TFLite Interpreter and Keras Model objects."""
+    import tensorflow as tf
     if isinstance(model_or_interpreter, tf.lite.Interpreter):
         inp_details = model_or_interpreter.get_input_details()
         out_details = model_or_interpreter.get_output_details()
@@ -227,6 +237,7 @@ def predict_single_image(image_path, model=None):
                 "probabilities": {EMOTION_LABELS[i]: float(fused_preds[i]) * 100.0 for i in range(len(EMOTION_LABELS))}
             })
 
+    gc.collect()
     return results, img
 
 

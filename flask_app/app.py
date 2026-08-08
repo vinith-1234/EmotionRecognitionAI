@@ -1,12 +1,14 @@
 import os
 
 # ── Limit TensorFlow Memory and CPU Thread Overhead for Free Cloud Tier (512MB RAM)
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
 os.environ['TF_NUM_INTEROP_THREADS'] = '1'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 import sys
+import gc
 import base64
 import cv2
 import numpy as np
@@ -32,7 +34,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 # ── Pre-load model globally on startup ───────────────────────────────────────
 print("[INFO] Initializing Flask server & loading Emotion Recognition Model...")
 MODEL = None
-MODEL_PATH = os.path.join(ROOT_DIR, "saved_models", "emotion_model.keras")
+MODEL_PATH = os.path.join(ROOT_DIR, "saved_models", "emotion_model.tflite")
 
 try:
     MODEL = load_emotion_model(MODEL_PATH)
@@ -106,6 +108,7 @@ def predict_emotion_route():
         ann_b64 = "data:image/jpeg;base64," + base64.b64encode(ann_buf).decode('utf-8')
 
         primary = results[0] if results else None
+        gc.collect()
 
         return jsonify({
             'success': True,
@@ -120,6 +123,7 @@ def predict_emotion_route():
 
     except Exception as e:
         print(f"[ERROR] /predict endpoint error: {e}")
+        gc.collect()
         return jsonify({'error': f'Prediction execution failed: {str(e)}'}), 500
 
 
@@ -162,6 +166,7 @@ def predict_frame_route():
         ann_b64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
 
         primary = results[0] if results else None
+        gc.collect()
 
         return jsonify({
             'success': True,
@@ -174,6 +179,7 @@ def predict_frame_route():
 
     except Exception as e:
         print(f"[ERROR] /predict_frame endpoint error: {e}")
+        gc.collect()
         return jsonify({'error': f'Live camera processing failed: {str(e)}'}), 500
 
 
